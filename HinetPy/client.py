@@ -195,15 +195,297 @@ class BaseClient:
         )
         # Hi-net server returns 200 even when the username or password is wrong, thus
         # I have to check the webpage content to make sure login is successful
-        if re.search(r"auth_log(?P<LOG>.*)\.png", resp.text).group("LOG") == "out":
+        match = re.search(r"auth_log(?P<LOG>.*)\.png", resp.text)
+        if not match or match.group("LOG") == "out":
             msg = "Unauthorized. Check your username and password!"
             raise requests.ConnectionError(msg)
 
 
-class ContinuousWaveformClient(BaseClient):
+class StationClient(BaseClient):
+    """
+    Client for manipulating stations.
+    """
+
+    def get_station_list(self, code):
+        """
+        Get station list of a network.
+
+        The function only supports the following networks:
+        Hi-net (0101), F-net (0103, 0103A), S-net (0120, 0120A) and MeSO-net (0131).
+
+        >>> stations = client.get_station_list("0101")
+        >>> for station in stations:
+        ...     print(station)
+        0101 N.WNNH 45.4883 141.885 -159.06
+        0101 N.SFNH 45.3346 142.1185 -81.6
+        ...
+        """
+        stations = []
+        # remove trailing 'A' in network code
+        if code in ["0101", "0103", "0103A"]:  # Hinet and Fnet
+            csvfile = requests.get(self._STATION_INFO, timeout=30).content.decode(
+                "utf-8"
+            )
+            for row in csv.DictReader(csvfile.splitlines(), delimiter=","):
+                org_id = row["organization_id"].strip("'")
+                net_id = row["network_id"].strip("'")
+                if org_id + net_id != code[:4]:
+                    continue
+                name = row["station_cd"]
+                latitude, longitude = row["latitude"], row["longitude"]
+                elevation = row["height(m)"]
+                stations.append(Station(code, name, latitude, longitude, elevation))
+        elif code in ["0120", "0120A", "0131"]:  # S-net and MeSO-net
+            if code in ["0120", "0120A"]:
+                url = self._SNET_STATION_INFO
+                ltext, rtext = "var snet_station = [", "];"
+            else:
+                url = self._MESONET_STATION_INFO
+                ltext, rtext = "var mesonet_station = [", "];"
+            json_text = self.session.get(url).text.lstrip(ltext).rstrip(rtext)
+            for station in json.loads(json_text)["features"]:
+                prop = station["properties"]
+                name = prop["station_cd"]
+                latitude, longitude = prop["latitude"], prop["longitude"]
+                elevation = prop["sensor_height"]
+                stations.append(Station(code, name, latitude, longitude, elevation))
+        else:
+            raise ValueError("Only support Hi-net, F-net, S-net and MeSO-net.")
+        return stations
+
+    def get_selected_stations(self, code: str):
+        """
+        Query stations selected for requesting data.
+
+        It supports two networks: Hi-net (0101) and F-net (0103, 0103A).
+
+        Parameters
+        ----------
+        code
+            Network code.
+
+        Returns
+        -------
+        stations: list of :class:`~HinetPy.client.Station`
+            List of selected stations with station metadata information.
+
+        Examples
+        --------
+        >>> stations = client.get_selected_stations("0101")
+        >>> len(stations)
+        16
+        >>> for station in stations:
+        ...     print(station)
+        0101 N.WNNH 45.4883 141.885 -159.06
+        0101 N.SFNH 45.3346 142.1185 -81.6
+        >>> names = [station.name for station in stations]
+        >>> print(*names)
+        N.WNNH N.SFNH ...
+        """
+        if code == "0101":
+            pattern = r"N\..{3}H"
+        elif code in ("0103", "0103A"):
+            pattern = r"N\..{3}F"
+        else:
+            raise ValueError("Can only query stations of Hi-net/F-net")
+
+        parser = _GrepTableData()
+        parser.feed(self.session.get(self._STATION, timeout=self.timeout).text)
+        stations = []
+        for i, text in enumerate(parser.tabledata):
+            # If the target station, grep both lon and lat.
+            if re.match(pattern, text):
+                latitude, longitude, elevation = parser.tabledata[i + 3 : i + 6]
+                latitude = latitude.strip("N")
+                longitude = longitude.strip("E")
+                elevation = elevation.strip("m")
+
+                stations.append(
+                    Station(
+                        code=code,
+                        name=text,
+                        latitude=latitude,
+                        longitude=longitude,
+                        elevation=elevation,
+                    )
+                )
+        parser.close()
+        return stations
+
+    def select_stations(
+        self,
+        code,
+        stations=None,
+        minlatitude=None,
+        maxlatitude=None,
+        minlongitude=None,
+        maxlongitude=None,
+        latitude=None,
+        longitude=None,
+        minradius=None,
+        maxradius=None,
+    ):
+        """
+        Select stations of a network.
+
+        It only supports the following networks:
+        Hi-net (0101), F-net (0103, 0103A), S-net (0120, 0120A) and MeSO-net (0131).
+
+        Parameters
+        ----------
+        code: str
+            Network code.
+        stations: str or list
+            Stations to select.
+        minlatitude: float
+            Limit to stations with a latitude larger than the specified minimum.
+        maxlatitude: float
+            Limit to stations with a latitude smaller than the specified maximum.
+        minlongitude: float
+            Limit to stations with a longitude larger than the specified minimum.
+        maxlongitude: float
+            Limit to stations with a longitude smaller than the specified maximum.
+        latitude: float
+            Specify the latitude to be used for a radius search.
+        longitude: float
+            Specify the longitude to be used for a radius search.
+        minradius: float
+            Limit to stations within the specified minimum number of degrees from the
+            geographic point defined by the latitude and longitude parameters.
+        maxradius: float
+            Limit to stations within the specified maximum number of degrees from the
+            geographic point defined by the latitude and longitude parameters.
+
+        Examples
+        --------
+        Select only two stations of Hi-net:
+
+        >>> client.select_stations("0101", ["N.AAKH", "N.ABNH"])
+        >>> len(client.get_selected_stations("0101"))
+        2
+
+        Select stations in a box region:
+
+        >>> client.select_stations(
+        ...     "0101",
+        ...     minlatitude=40,
+        ...     maxlatitude=50,
+        ...     minlongitude=140,
+        ...     maxlongitude=150,
+        ... )
+
+        Select stations in a circular region:
+
+        >>> client.select_stations(
+        ...     "0101", latitude=30, longitude=139, minradius=0, maxradius=2
+        ... )
+
+        Select all Hi-net stations:
+
+        >>> client.select_stations("0101")
+        >>> len(client.get_selected_stations("0101"))
+        0
+
+        """
+        stations_selected = []
+
+        if stations is None:
+            pass
+        elif isinstance(stations, str):  # stations is a str, i.e., one station
+            stations_selected.append(stations)
+        elif isinstance(stations, list):  # list of stations
+            stations_selected.extend(stations)
+        else:
+            raise ValueError("stations should be either a str or a list.")
+
+        # get station list from Hi-net server
+        stations_at_server = self.get_station_list(code)
+
+        # select stations in a box region
+        if minlatitude or maxlatitude or minlongitude or maxlongitude:
+            stations_selected = [
+                station.name
+                for station in stations_at_server
+                if station.code == code
+                and point_inside_box(
+                    station.latitude,
+                    station.longitude,
+                    minlatitude=minlatitude,
+                    maxlatitude=maxlatitude,
+                    minlongitude=minlongitude,
+                    maxlongitude=maxlongitude,
+                )
+            ]
+
+        # select stations in a circular region
+        if (latitude and longitude) and (minradius or maxradius):
+            stations_selected = [
+                station.name
+                for station in stations_at_server
+                if station.code == code
+                and point_inside_circular(
+                    station.latitude,
+                    station.longitude,
+                    latitude,
+                    longitude,
+                    minradius=minradius,
+                    maxradius=maxradius,
+                )
+            ]
+        payload = {
+            "net": code,
+            "stcds": ":".join(stations_selected) if stations_selected else None,
+            "mode": "1",
+        }
+        self.session.post(self._CONT_SELECT, data=payload, timeout=self.timeout)
+
+
+class ContinuousWaveformClient(StationClient):
     """
     Client for requesting continuous waveform data.
     """
+
+    def _get_allowed_span(self, code):
+        """
+        Get allowed max span for each network.
+
+        Hi-net server sets two limitations of data file size:
+
+        #. Number_of_channels * record_length(min.) <= 12000 min
+        #. record_length <= 60min
+
+        >>> client._get_allowed_span("0201")
+        60
+
+        Parameters
+        ----------
+        code: str
+            Network code.
+
+        Returns
+        -------
+        max_span: int
+            Maximum allowed span in mimutes.
+        """
+        # hard-coded total number of channels
+        channels = NETWORK[code].channels
+        if channels is None:
+            channels = 0
+        # query the actual number of channels
+        if code in ("0101", "0103", "0103A"):
+            stations = len(self.get_selected_stations(code))
+            if stations != 0:
+                channels = stations * 3
+
+        if code in ("0103", "0103A"):
+            # Maximum allowed file size is ~55 MB for F-net
+            f_net_dl_factor, f_net_max_size = 8.8667638012, 55000
+            if channels == 0:
+                return 60
+            return int(f_net_max_size / (f_net_dl_factor * channels))
+        if channels == 0:
+            return 60
+        return min(int(12000 / channels), 60)
 
     def _request_cont_waveform(self, code, starttime, span):
         """
@@ -248,9 +530,13 @@ class ContinuousWaveformClient(BaseClient):
                     self._CONT_REQUEST, params=payload, timeout=self.timeout
                 )
                 # assume the first one on the status page is the current data
-                id = re.search(  # noqa: A001
+                match = re.search(  # noqa: A001
                     r'<td class="bgcolist2">(?P<ID>\d{10})</td>', resp.text
-                ).group("ID")
+                )
+                if not match:
+                    continue
+                id = match.group("ID")
+
                 p = re.compile(
                     r'<tr class="bglist(?P<OPT>\d)">'  # noqa: ISC003
                     + r'<td class="bgcolist2">'
@@ -260,7 +546,10 @@ class ContinuousWaveformClient(BaseClient):
                 # wait until data is ready
                 for _i in range(self.max_sleep_count):
                     status = self.session.post(self._CONT_STATUS, timeout=self.timeout)
-                    opt = p.search(status.text).group("OPT")
+                    opt_match = p.search(status.text)
+                    if not opt_match:
+                        continue
+                    opt = opt_match.group("OPT")
                     if opt == "1":  # still preparing data
                         time.sleep(self.sleep_time_in_seconds)
                     elif opt == "2":  # data is available
@@ -326,7 +615,10 @@ class ContinuousWaveformClient(BaseClient):
                                 cnts.append(filename)
                             elif filename.endswith(".euc.ch"):
                                 ctable = filename
-                        fz.extractall(members=[*cnts, ctable])
+                        if ctable:
+                            fz.extractall(members=[*cnts, ctable])
+                        else:
+                            fz.extractall(members=cnts)
                     return cnts, ctable
             except Exception:  # noqa: BLE001, S112
                 continue
@@ -346,6 +638,7 @@ class ContinuousWaveformClient(BaseClient):
         outdir=None,
         threads=3,
         cleanup=True,
+        merge_files=True,
     ):
         """
         Get continuous waveform data from Hi-net server.
@@ -373,11 +666,16 @@ class ContinuousWaveformClient(BaseClient):
             Parallel data download using more threads.
         cleanup: bool
             Clean up one-minute cnt files after merging.
+        merge_files: bool
+            Merge one-minute cnt files into a single file. If False,
+            the one-minute cnt files will be moved to ``outdir`` and
+            the ``cleanup`` argument will be ignored.
 
         Returns
         -------
-        data: str
-            Filename of downloaded win32 data.
+        data: str or list
+            Filename of downloaded win32 data. If ``merge_files=False``, a list of
+            filenames is returned.
         ctable: str
             Filename of downloaded channel table file.
 
@@ -452,12 +750,14 @@ class ContinuousWaveformClient(BaseClient):
         # Special handling for MeSO-net since it has two network codes:
         # - 0131: Data after 20170401
         # - 0231: Data 20080516-20170401
-        mesonet_time = NETWORK["0131"].starttime
+        mesonet_time = to_datetime(NETWORK["0131"].starttime)
         if code == "0131" and starttime < mesonet_time:
             code = "0231"
         if code == "0231" and starttime >= mesonet_time:
             code = "0131"
-        if code in ("0131", "0231") and starttime <= mesonet_time <= endtime:
+        if code in ("0131", "0231") and not (
+            endtime <= mesonet_time or starttime >= mesonet_time
+        ):
             msg = (
                 "MeSO-net has two network codes: '0131' for data after 20170401, and "
                 "'0231' for data 20080516-20170401. But the time span you requested "
@@ -465,7 +765,7 @@ class ContinuousWaveformClient(BaseClient):
             )
             raise ValueError(msg)
 
-        time0 = NETWORK[code].starttime
+        time0 = to_datetime(NETWORK[code].starttime)
         # time1 = UTCTime + JST (UTC+0900) - 2 hour delay
         time1 = datetime.utcnow() + timedelta(hours=9) + timedelta(hours=-2)
         if not time0 <= starttime < endtime <= time1:
@@ -513,11 +813,13 @@ class ContinuousWaveformClient(BaseClient):
             with ThreadPool(min(threads, len(jobs))) as p:
                 rvalue = p.map(self._download_cont_waveform, jobs)
             for value in rvalue:
-                cnts.extend(value[0])
-                ch_euc.add(value[1])
+                if value and value[0]:
+                    cnts.extend(value[0])
+                    ch_euc.add(value[1])
 
         # post processes
         # 1. always sort cnts by name/time to avoid use -s option of catwin32
+        cnts_to_cleanup = sorted(cnts)
         cnts = sorted(cnts)
         #    always use the first ctable
         ch_euc = sorted(ch_euc)[0]
@@ -525,13 +827,23 @@ class ContinuousWaveformClient(BaseClient):
         # 2. merge all cnt files
         if not data:
             data = f'{code}_{starttime.strftime("%Y%m%d%H%M")}_{span:d}.cnt'
-        dirname = None
-        if os.path.dirname(data):
-            dirname = os.path.dirname(data)
-        elif outdir:
-            dirname = outdir
-            data = os.path.join(dirname, data)
-        merge(cnts, data)
+        if outdir and not os.path.dirname(data):
+            data = os.path.join(outdir, data)
+
+        if merge_files:
+            merge(cnts, data)
+        else:
+            moved_cnts = []
+            if outdir:
+                if not os.path.exists(outdir):
+                    os.makedirs(outdir, exist_ok=True)
+                for cnt in cnts:
+                    new_path = os.path.join(outdir, os.path.basename(cnt))
+                    shutil.move(cnt, new_path)
+                    moved_cnts.append(new_path)
+            else:
+                moved_cnts = cnts
+            data = moved_cnts
 
         # 3. rename channeltable file
         if not ctable:
@@ -547,8 +859,8 @@ class ContinuousWaveformClient(BaseClient):
             os.makedirs(dirname, exist_ok=True)
         shutil.move(ch_euc, ctable)
         # 4. cleanup
-        if cleanup:
-            for cnt in cnts:
+        if merge_files and cleanup:
+            for cnt in cnts_to_cleanup:
                 os.remove(cnt)
 
         return data, ctable
@@ -654,9 +966,13 @@ class EventWaveformClient(BaseClient):
                     self._EVENT_REQUEST, data=payload, timeout=self.timeout
                 )
                 # assume the first one on the status page is the current one
-                id = re.search(  # noqa: A001
+                match = re.search(  # noqa: A001
                     r'<td class="bgevlist2">(?P<ID>\d{10})</td>', resp.text
-                ).group("ID")
+                )
+                if not match:
+                    continue
+                id = match.group("ID")
+
                 p = re.compile(
                     r'<tr class="bglist(?P<OPT>\d)">'  # noqa: ISC003
                     + r'<td class="bgevlist2">'
@@ -666,7 +982,10 @@ class EventWaveformClient(BaseClient):
                 # wait until data is ready
                 for _i in range(self.max_sleep_count):
                     status = self.session.post(self._EVENT_STATUS, timeout=self.timeout)
-                    opt = p.search(status.text).group("OPT")
+                    opt_match = p.search(status.text)
+                    if not opt_match:
+                        continue
+                    opt = opt_match.group("OPT")
                     if opt == "1":  # still preparing data
                         time.sleep(self.sleep_time_in_seconds)
                     elif opt == "2":  # data is available
@@ -958,247 +1277,8 @@ class CatalogClient(BaseClient):
         return self._get_catalog("mecha", startdate, span, filename, os)
 
 
-class StationClient(BaseClient):
-    """
-    Client for manipulating stations.
-    """
-
-    def get_station_list(self, code):
-        """
-        Get station list of a network.
-
-        The function only supports the following networks:
-        Hi-net (0101), F-net (0103, 0103A), S-net (0120, 0120A) and MeSO-net (0131).
-
-        >>> stations = client.get_station_list("0101")
-        >>> for station in stations:
-        ...     print(station)
-        0101 N.WNNH 45.4883 141.885 -159.06
-        0101 N.SFNH 45.3346 142.1185 -81.6
-        ...
-        """
-        stations = []
-        # remove trailing 'A' in network code
-        if code in ["0101", "0103", "0103A"]:  # Hinet and Fnet
-            csvfile = requests.get(self._STATION_INFO, timeout=30).content.decode(
-                "utf-8"
-            )
-            for row in csv.DictReader(csvfile.splitlines(), delimiter=","):
-                org_id = row["organization_id"].strip("'")
-                net_id = row["network_id"].strip("'")
-                if org_id + net_id != code[:4]:
-                    continue
-                name = row["station_cd"]
-                latitude, longitude = row["latitude"], row["longitude"]
-                elevation = row["height(m)"]
-                stations.append(Station(code, name, latitude, longitude, elevation))
-        elif code in ["0120", "0120A", "0131"]:  # S-net and MeSO-net
-            if code in ["0120", "0120A"]:
-                url = self._SNET_STATION_INFO
-                ltext, rtext = "var snet_station = [", "];"
-            else:
-                url = self._MESONET_STATION_INFO
-                ltext, rtext = "var mesonet_station = [", "];"
-            json_text = self.session.get(url).text.lstrip(ltext).rstrip(rtext)
-            for station in json.loads(json_text)["features"]:
-                prop = station["properties"]
-                name = prop["station_cd"]
-                latitude, longitude = prop["latitude"], prop["longitude"]
-                elevation = prop["sensor_height"]
-                stations.append(Station(code, name, latitude, longitude, elevation))
-        else:
-            raise ValueError("Only support Hi-net, F-net, S-net and MeSO-net.")
-        return stations
-
-    def get_selected_stations(self, code: str):
-        """
-        Query stations selected for requesting data.
-
-        It supports two networks: Hi-net (0101) and F-net (0103, 0103A).
-
-        Parameters
-        ----------
-        code
-            Network code.
-
-        Returns
-        -------
-        stations: list of :class:`~HinetPy.client.Station`
-            List of selected stations with station metadata information.
-
-        Examples
-        --------
-        >>> stations = client.get_selected_stations("0101")
-        >>> len(stations)
-        16
-        >>> for station in stations:
-        ...     print(station)
-        0101 N.WNNH 45.4883 141.885 -159.06
-        0101 N.SFNH 45.3346 142.1185 -81.6
-        >>> names = [station.name for station in stations]
-        >>> print(*names)
-        N.WNNH N.SFNH ...
-        """
-        if code == "0101":
-            pattern = r"N\..{3}H"
-        elif code in ("0103", "0103A"):
-            pattern = r"N\..{3}F"
-        else:
-            raise ValueError("Can only query stations of Hi-net/F-net")
-
-        parser = _GrepTableData()
-        parser.feed(self.session.get(self._STATION, timeout=self.timeout).text)
-        stations = []
-        for i, text in enumerate(parser.tabledata):
-            # If the target station, grep both lon and lat.
-            if re.match(pattern, text):
-                latitude, longitude, elevation = parser.tabledata[i + 3 : i + 6]
-                latitude = latitude.strip("N")
-                longitude = longitude.strip("E")
-                elevation = elevation.strip("m")
-
-                stations.append(
-                    Station(
-                        code=code,
-                        name=text,
-                        latitude=latitude,
-                        longitude=longitude,
-                        elevation=elevation,
-                    )
-                )
-        parser.close()
-        return stations
-
-    def select_stations(
-        self,
-        code,
-        stations=None,
-        minlatitude=None,
-        maxlatitude=None,
-        minlongitude=None,
-        maxlongitude=None,
-        latitude=None,
-        longitude=None,
-        minradius=None,
-        maxradius=None,
-    ):
-        """
-        Select stations of a network.
-
-        It only supports the following networks:
-        Hi-net (0101), F-net (0103, 0103A), S-net (0120, 0120A) and MeSO-net (0131).
-
-        Parameters
-        ----------
-        code: str
-            Network code.
-        stations: str or list
-            Stations to select.
-        minlatitude: float
-            Limit to stations with a latitude larger than the specified minimum.
-        maxlatitude: float
-            Limit to stations with a latitude smaller than the specified maximum.
-        minlongitude: float
-            Limit to stations with a longitude larger than the specified minimum.
-        maxlongitude: float
-            Limit to stations with a longitude smaller than the specified maximum.
-        latitude: float
-            Specify the latitude to be used for a radius search.
-        longitude: float
-            Specify the longitude to be used for a radius search.
-        minradius: float
-            Limit to stations within the specified minimum number of degrees from the
-            geographic point defined by the latitude and longitude parameters.
-        maxradius: float
-            Limit to stations within the specified maximum number of degrees from the
-            geographic point defined by the latitude and longitude parameters.
-
-        Examples
-        --------
-        Select only two stations of Hi-net:
-
-        >>> client.select_stations("0101", ["N.AAKH", "N.ABNH"])
-        >>> len(client.get_selected_stations("0101"))
-        2
-
-        Select stations in a box region:
-
-        >>> client.select_stations(
-        ...     "0101",
-        ...     minlatitude=40,
-        ...     maxlatitude=50,
-        ...     minlongitude=140,
-        ...     maxlongitude=150,
-        ... )
-
-        Select stations in a circular region:
-
-        >>> client.select_stations(
-        ...     "0101", latitude=30, longitude=139, minradius=0, maxradius=2
-        ... )
-
-        Select all Hi-net stations:
-
-        >>> client.select_stations("0101")
-        >>> len(client.get_selected_stations("0101"))
-        0
-
-        """
-        stations_selected = []
-
-        if stations is None:
-            pass
-        elif isinstance(stations, str):  # stations is a str, i.e., one station
-            stations_selected.append(stations)
-        elif isinstance(stations, list):  # list of stations
-            stations_selected.extend(stations)
-        else:
-            raise ValueError("stations should be either a str or a list.")
-
-        # get station list from Hi-net server
-        stations_at_server = self.get_station_list(code)
-
-        # select stations in a box region
-        if minlatitude or maxlatitude or minlongitude or maxlongitude:
-            stations_selected = [
-                station.name
-                for station in stations_at_server
-                if station.code == code
-                and point_inside_box(
-                    station.latitude,
-                    station.longitude,
-                    minlatitude=minlatitude,
-                    maxlatitude=maxlatitude,
-                    minlongitude=minlongitude,
-                    maxlongitude=maxlongitude,
-                )
-            ]
-
-        # select stations in a circular region
-        if (latitude and longitude) and (minradius or maxradius):
-            stations_selected = [
-                station.name
-                for station in stations_at_server
-                if station.code == code
-                and point_inside_circular(
-                    station.latitude,
-                    station.longitude,
-                    latitude,
-                    longitude,
-                    minradius=minradius,
-                    maxradius=maxradius,
-                )
-            ]
-        payload = {
-            "net": code,
-            "stcds": ":".join(stations_selected) if stations_selected else None,
-            "mode": "1",
-        }
-        self.session.post(self._CONT_SELECT, data=payload, timeout=self.timeout)
-
-
 class Client(
-    ContinuousWaveformClient, EventWaveformClient, CatalogClient, StationClient
+    ContinuousWaveformClient, EventWaveformClient, CatalogClient
 ):
     """
     Wrapper client to request waveform, catalog and manipulate stations.
@@ -1224,42 +1304,6 @@ class Client(
         check_package_release()
         check_cmd_exists("catwin32")
         check_cmd_exists("win2sac_32")
-
-    def _get_allowed_span(self, code):
-        """
-        Get allowed max span for each network.
-
-        Hi-net server sets two limitations of data file size:
-
-        #. Number_of_channels * record_length(min.) <= 12000 min
-        #. record_length <= 60min
-
-        >>> client._get_allowed_span("0201")
-        60
-
-        Parameters
-        ----------
-        code: str
-            Network code.
-
-        Returns
-        -------
-        max_span: int
-            Maximum allowed span in mimutes.
-        """
-        # hard-coded total number of channels
-        channels = NETWORK[code].channels
-        # query the actual number of channels
-        if code in ("0101", "0103", "0103A"):
-            stations = len(self.get_selected_stations(code))
-            if stations != 0:
-                channels = stations * 3
-
-        if code in ("0103", "0103A"):
-            # Maximum allowed file size is ~55 MB for F-net
-            f_net_dl_factor, f_net_max_size = 8.8667638012, 55000
-            return int(f_net_max_size / (f_net_dl_factor * channels))
-        return min(int(12000 / channels), 60)
 
     def check_service_update(self):
         """
@@ -1307,7 +1351,7 @@ class Client(
             info = f"== Information of Network {code} ==\n"
             info += f"Name: {net.name}\n"
             info += f"Homepage: {net.url}\n"
-            info += f"Starttime: {net.starttime.strftime('%Y%m%d')}\n"
+            info += f"Starttime: {to_datetime(net.starttime).strftime('%Y%m%d')}\n"
             info += f"No. of channels: {net.channels}"
             print(info)
         else:
