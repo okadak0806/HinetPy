@@ -24,3 +24,4 @@ _build/
 
 # macOS
 .DS_Store
+.env
